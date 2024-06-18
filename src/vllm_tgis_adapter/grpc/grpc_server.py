@@ -17,10 +17,10 @@ from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 from vllm import AsyncLLMEngine, SamplingParams
 from vllm.engine.async_llm_engine import _AsyncLLMEngine
-from vllm.entrypoints.grpc.adapters import AdapterStore, validate_adapters
+from .adapters import AdapterStore, validate_adapters
 from vllm.entrypoints.openai.serving_completion import merge_async_iterators
 from vllm.inputs import TextTokensPrompt
-from vllm.tgis_utils.guided_decoding import (
+from vllm_tgis_adapter.tgis_utils.guided_decoding import (
     get_outlines_guided_decoding_logits_processor,
 )
 
@@ -165,12 +165,11 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
         self.skip_special_tokens = not args.output_special_tokens
         self.default_include_stop_seqs = args.default_include_stop_seqs
 
-        self.adapter_store: AdapterStore | None = None
-        if args.adapter_cache:
-            self.adapter_store = AdapterStore(
-                cache_path=args.adapter_cache, adapters={}
-            )
-
+        self.adapter_store = (
+            AdapterStore(cache_path=args.adapter_cache, adapters={})
+            if args.adapter_cache
+            else None
+        )
         self.health_servicer = health_servicer
 
     @property
@@ -182,8 +181,7 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
 
     async def post_init(self) -> None:
         self.config = await self.engine.get_model_config()
-        # self.tokenizer_group = await self.engine.get_tokenizer_group()
-        self.tokenizer_group = self.engine.engine.tokenizer
+        self.tokenizer_group = self.engine.get_tokenizer_group()
         self.tokenizer = await self.engine.get_tokenizer()
         assert self.tokenizer is not None
 

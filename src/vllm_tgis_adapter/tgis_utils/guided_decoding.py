@@ -4,10 +4,9 @@ import asyncio
 import concurrent.futures
 from copy import copy
 from re import escape as regex_escape
-from typing import tuple
 
 from transformers import PreTrainedTokenizer
-from vllm.entrypoints.grpc.pb.generation_pb2 import DecodingParameters
+from vllm_tgis_adapter.grpc.pb.generation_pb2 import DecodingParameters
 from vllm.model_executor.guided_decoding import outlines_decoding
 from vllm.model_executor.guided_decoding.outlines_decoding import (
     GuidedDecodingMode,
