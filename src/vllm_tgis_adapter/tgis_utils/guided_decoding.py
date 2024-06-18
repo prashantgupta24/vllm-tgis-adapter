@@ -6,7 +6,6 @@ from copy import copy
 from re import escape as regex_escape
 
 from transformers import PreTrainedTokenizer
-from vllm_tgis_adapter.grpc.pb.generation_pb2 import DecodingParameters
 from vllm.model_executor.guided_decoding import outlines_decoding
 from vllm.model_executor.guided_decoding.outlines_decoding import (
     GuidedDecodingMode,
@@ -18,6 +17,8 @@ from vllm.model_executor.guided_decoding.outlines_logits_processors import (
     JSONLogitsProcessor,
     RegexLogitsProcessor,
 )
+
+from vllm_tgis_adapter.grpc.pb.generation_pb2 import DecodingParameters
 
 
 async def get_outlines_guided_decoding_logits_processor(

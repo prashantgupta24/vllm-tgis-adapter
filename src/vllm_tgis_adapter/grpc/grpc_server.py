@@ -17,15 +17,14 @@ from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 from vllm import AsyncLLMEngine, SamplingParams
 from vllm.engine.async_llm_engine import _AsyncLLMEngine
-from .adapters import AdapterStore, validate_adapters
 from vllm.entrypoints.openai.serving_completion import merge_async_iterators
 from vllm.inputs import TextTokensPrompt
-from vllm_tgis_adapter.tgis_utils.guided_decoding import (
-    get_outlines_guided_decoding_logits_processor,
-)
 
 from vllm_tgis_adapter.logging import init_logger
 from vllm_tgis_adapter.tgis_utils import logs
+from vllm_tgis_adapter.tgis_utils.guided_decoding import (
+    get_outlines_guided_decoding_logits_processor,
+)
 from vllm_tgis_adapter.tgis_utils.logits_processors import (
     ExpDecayLengthPenaltyWarper,
     TypicalLogitsWarperWrapper,
@@ -36,6 +35,7 @@ from vllm_tgis_adapter.tgis_utils.metrics import (
     TGISStatLogger,
 )
 
+from .adapters import AdapterStore, validate_adapters
 from .pb import generation_pb2_grpc
 from .pb.generation_pb2 import DESCRIPTOR as _GENERATION_DESCRIPTOR
 from .pb.generation_pb2 import (
