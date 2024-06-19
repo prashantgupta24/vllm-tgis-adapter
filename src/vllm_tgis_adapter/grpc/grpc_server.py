@@ -22,6 +22,9 @@ from vllm.inputs import TextTokensPrompt
 
 from vllm_tgis_adapter.logging import init_logger
 from vllm_tgis_adapter.tgis_utils import logs
+from vllm_tgis_adapter.tgis_utils.guided_decoding import (
+    get_outlines_guided_decoding_logits_processor,
+)
 from vllm_tgis_adapter.tgis_utils.logits_processors import (
     ExpDecayLengthPenaltyWarper,
     TypicalLogitsWarperWrapper,
@@ -32,6 +35,7 @@ from vllm_tgis_adapter.tgis_utils.metrics import (
     TGISStatLogger,
 )
 
+from .adapters import AdapterStore, validate_adapters
 from .pb import generation_pb2_grpc
 from .pb.generation_pb2 import DESCRIPTOR as _GENERATION_DESCRIPTOR
 from .pb.generation_pb2 import (
@@ -54,8 +58,8 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
     from vllm import CompletionOutput, RequestOutput
     from vllm.config import ModelConfig
+    from vllm.lora.request import LoRARequest
     from vllm.sequence import Logprob
-    from vllm.transformers_utils.tokenizer_group import BaseTokenizerGroup
 
     from .pb.generation_pb2 import (
         BatchedGenerationRequest,
@@ -160,18 +164,16 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
         self.skip_special_tokens = not args.output_special_tokens
         self.default_include_stop_seqs = args.default_include_stop_seqs
 
+        self.adapter_store = (
+            AdapterStore(cache_path=args.adapter_cache, adapters={})
+            if args.adapter_cache
+            else None
+        )
         self.health_servicer = health_servicer
-
-    @property
-    def tokenizer_group(self) -> BaseTokenizerGroup:
-        assert hasattr(self.engine.engine, "tokenizer")
-        assert self.engine.engine.tokenizer is not None
-
-        return self.engine.engine.tokenizer
 
     async def post_init(self) -> None:
         self.config = await self.engine.get_model_config()
-
+        self.tokenizer_group = self.engine.engine.get_tokenizer_group()
         self.tokenizer = await self.engine.get_tokenizer()
         assert self.tokenizer is not None
 
@@ -209,6 +211,9 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
 
         generators = []
         max_is_token_limit = [False] * request_count
+
+        adapter_kwargs = await self._validate_adapters(request, context)
+
         for i, req in enumerate(request.requests):
             input_ids, max_is_token_limit[i] = await self._validate_prompt_and_tokenize(
                 sampling_params, truncate_input_tokens, req.text, context
@@ -223,6 +228,7 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
                     inputs=inputs,
                     sampling_params=sampling_params,
                     request_id=f"{request_id}-{i}",
+                    **adapter_kwargs,
                 ),
             )
 
@@ -255,10 +261,7 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
         for i in range(len(responses)):
             res = responses[i]
             response = self._convert_output(
-                res.outputs[0],
-                resp_options,
-                max_is_token_limit=max_is_token_limit[i],
-                time_limit_reached=time_limit_reached,
+                res.outputs[0], resp_options, max_is_token_limit[i], time_limit_reached
             )
             response = self._convert_input_details(
                 res, resp_options, sampling_params, response
@@ -271,6 +274,7 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
                 sub_request_num=i,
                 logger=logger,
             )
+            service_metrics.observe_generation_success(start_time=start_time)
             responses[i] = response
 
         return BatchedGenerationResponse(responses=responses)
@@ -293,6 +297,7 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
             sampling_params, truncate_input_tokens, request.request.text, context
         )
 
+        adapter_kwargs = await self._validate_adapters(request, context)
         inputs = TextTokensPrompt(
             prompt=request.request.text, prompt_token_ids=input_ids
         )
@@ -303,12 +308,13 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
             inputs=inputs,
             sampling_params=sampling_params,
             request_id=request_id,
+            **adapter_kwargs,
         )
 
         resp_options = request.params.response
 
-        first = True
         first_response = None
+        last_response = None
         last_output_length = 0
         last_token_count = 0
         time_limit_reached = False
@@ -317,13 +323,13 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
         # TODO handle cancellation
         async for result in result_generator:
             last_engine_response = result
-            if first:
+            if first_response is None:
                 service_metrics.observe_queue_time(result)
                 first_response = self._convert_input_details(
                     result, resp_options, sampling_params, GenerationResponse()
                 )
+                last_response = first_response
                 yield first_response
-                first = False
 
             output = result.outputs[0]
 
@@ -332,7 +338,7 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
                 time_limit_reached = True
 
             # Convert output text and token_ids to deltas
-            yield self._convert_output(
+            last_response = self._convert_output(
                 output,
                 resp_options,
                 max_is_tok_limit,
@@ -340,21 +346,28 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
                 last_output_length,
                 last_token_count,
             )
-            if time_limit_reached:
-                break
+            yield last_response
 
             last_output_length = len(output.text)
             last_token_count = len(output.token_ids)
             # Save full output for logging
             full_output = output.text
 
+            if time_limit_reached:
+                break
+
         # Edit up the first_response for logging purposes only
         if first_response is None:
             # We didn't output anything!
             return
+
+        # Log and record metrics
+        assert last_response is not None
         first_response.text = full_output
-        first_response.generated_token_count = last_token_count
-        self.log_response(
+        first_response.stop_reason = last_response.stop_reason
+        first_response.stop_sequence = last_response.stop_sequence
+        first_response.generated_token_count = last_response.generated_token_count
+        logs.log_response(
             request=request,
             response=first_response,
             start_time=start_time,
@@ -363,6 +376,7 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
             else None,
             logger=logger,
         )
+        service_metrics.observe_generation_success(start_time=start_time)
 
     def _convert_input_details(
         self,
@@ -500,10 +514,29 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
                 )
             )
 
+        guided_decode_logit_processor = (
+            await get_outlines_guided_decoding_logits_processor(
+                decoding, self.tokenizer
+            )
+        )
+        if guided_decode_logit_processor is not None:
+            logits_processors.append(guided_decode_logit_processor)
+
         time_limit_millis = stopping.time_limit_millis
         deadline = (
             time.time() + time_limit_millis / 1000.0 if time_limit_millis > 0 else None
         )
+
+        random_sampling_params: dict[str, Any]
+        if greedy:
+            random_sampling_params = {"temperature": 0.0}
+        else:
+            random_sampling_params = {
+                "temperature": with_default(sampling.temperature, 1.0),
+                "top_k": with_default(sampling.top_k, -1),
+                "top_p": with_default(sampling.top_p, 1.0),
+                "seed": sampling.seed if sampling.HasField("seed") else None,
+            }
 
         try:
             sampling_params = SamplingParams(
@@ -511,12 +544,6 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
                 prompt_logprobs=logprobs if resp_options.input_tokens else None,
                 max_tokens=max_new_tokens,
                 min_tokens=min_new_tokens,
-                temperature=with_default(sampling.temperature, 1.0)
-                if not greedy
-                else 0.0,
-                top_k=with_default(sampling.top_k, -1),
-                top_p=with_default(sampling.top_p, 1.0),
-                seed=sampling.seed if sampling.HasField("seed") else None,
                 repetition_penalty=with_default(decoding.repetition_penalty, 1.0),
                 logits_processors=logits_processors,
                 stop=with_default(stopping.stop_sequences, None),
@@ -524,6 +551,7 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
                 if stopping.HasField("include_stop_sequence")
                 else self.default_include_stop_seqs,
                 skip_special_tokens=self.skip_special_tokens,
+                **random_sampling_params,
             )
         except ValueError as vllm_validation_error:
             # There may be validation cases caught by vLLM that are not covered
@@ -532,6 +560,20 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
             await context.abort(StatusCode.INVALID_ARGUMENT, str(vllm_validation_error))
 
         return sampling_params, deadline
+
+    async def _validate_adapters(
+        self,
+        request: SingleGenerationRequest | BatchedGenerationRequest,
+        context: ServicerContext,
+    ) -> dict[str, LoRARequest]:
+        try:
+            adapters = await validate_adapters(
+                request=request, adapter_store=self.adapter_store
+            )
+        except ValueError as e:
+            service_metrics.count_request_failure(FailureReasonLabel.VALIDATION)
+            await context.abort(StatusCode.INVALID_ARGUMENT, str(e))
+        return adapters
 
     @staticmethod
     def _convert_reason(
@@ -689,7 +731,7 @@ class TextGenerationService(generation_pb2_grpc.GenerationServiceServicer):
     async def Tokenize(
         self, request: BatchedTokenizeRequest, context: ServicerContext
     ) -> BatchedTokenizeResponse:
-        service_metrics.observe_tokenization_request(request)
+        service_metrics.count_tokenization_request(request)
         # TODO implement these
         if request.return_offsets:
             await context.abort(
